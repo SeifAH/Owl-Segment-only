@@ -49,21 +49,24 @@ def main() -> None:
     print(f"{len(images)} images from {folder}\nResults -> {out}\n", flush=True)
     rows, obj_rows, failed = [], [], []
     t_all = time.perf_counter()
-    # the next image is decoded and the last result written in background threads while the GPU works
+    # the next image is decoded, and earlier results drawn and written, in background threads while the GPU works
     loader, writer = ThreadPoolExecutor(max_workers=2), ThreadPoolExecutor(max_workers=4)
     pending, saves = {}, []
+    t_loaded = None  # after the first image, which includes loading the models
     for n, path in enumerate(images, 1):
         for k in (n - 1, n):  # this image and the next one
             if k < len(images) and k not in pending:
                 pending[k] = loader.submit(_load, images[k])
         try:
-            res = pipe.run(pending.pop(n - 1).result(), s)
+            img = pending.pop(n - 1).result()
+            res = pipe.run(img, s, draw=False)
         except Exception as e:  # keep going; report at the end
             print(f"[{n}/{len(images)}] {path.name}: FAILED ({e})", flush=True)
             failed.append(path.name)
             continue
-        saves.append(writer.submit(res.annotated.save, out / "annotated" / f"{path.stem}.png", compress_level=1))
-        area = res.annotated.width * res.annotated.height
+        saves.append(writer.submit(lambda r=res, p=out / "annotated" / f"{path.stem}.png":
+                                   r.render().save(p, compress_level=1)))
+        area = img.width * img.height
         rows.append({"image": path.name, "objects": len(res.objects), "time_s": res.timings["total"]})
         for o in res.objects:
             x0, y0, x1, y1 = o["box"]
@@ -71,9 +74,12 @@ def main() -> None:
                              "x1": x1, "y1": y1, "mask_area_px": o["mask_area"],
                              "mask_area_pct": round(100 * o["mask_area"] / area, 3)})
         print(f"[{n}/{len(images)}] {path.name}: {len(res.objects)} objects in {res.timings['total']} s", flush=True)
+        if t_loaded is None:
+            t_loaded, n_loaded = time.perf_counter(), n
 
     for f in saves:
         f.result()
+    t_end = time.perf_counter()
     loader.shutdown()
     writer.shutdown()
     with open(out / "summary.csv", "w", newline="", encoding="utf-8-sig") as f:  # utf-8-sig: opens cleanly in Excel
@@ -87,7 +93,9 @@ def main() -> None:
         w.writerows(obj_rows)
 
     total = sum(r["objects"] for r in rows)
-    print(f"\nDone: {len(rows)} images, {total} objects in {time.perf_counter() - t_all:.0f} s.")
+    print(f"\nDone: {len(rows)} images, {total} objects in {t_end - t_all:.0f} s.")
+    if t_loaded is not None and len(images) > n_loaded:
+        print(f"After loading the models: {(t_end - t_loaded) / (len(images) - n_loaded):.2f} s per image.")
     if failed:
         print(f"Failed ({len(failed)}): {', '.join(failed)}")
     print(f"Summary: {out / 'summary.csv'}\nPer object: {out / 'objects.csv'}\nImages: {out / 'annotated'}")

@@ -39,14 +39,14 @@ Same setup as on Windows (uv, environment in `~/.venvs/owl-sam-segment`, models 
 
 | Workstation (Threadripper 7970X + RTX A5000), per image | original code* | **CUDA backend** |
 |---|---|---|
-| `crushed_cans.jpg` (166 objects) | 14.2 s | **0.87 s** |
-| `kitchen.jpg` (51 objects) | 6.2 s | **0.37 s** |
+| `crushed_cans.jpg` (166 objects) | 14.2 s | **0.68 s** |
+| `kitchen.jpg` (51 objects) | 6.2 s | **0.33 s** |
 | `recycling.jpg` (5 objects) | 4.4 s | **0.27 s** |
 | 2048 × 2048 belt frame | 4.0 s | **0.30 s** |
 
 \* On this machine the original code fell back to PyTorch on the CPU: OpenVINO lists the NVIDIA card as "GPU" but cannot compile for it. Same objects in both columns (boxes and mask areas identical or within float rounding).
 
-The first start compiles the models for the GPU (`torch.compile`, a few minutes once; later starts about 15 s). `OWLSEG_COMPILE=0` skips it (~10% slower per image, starts in seconds).
+Folder batches run at about 0.3 s per image after the models are loaded. The first start compiles the models for the GPU (`torch.compile`, a few minutes once; later starts about 15 s). `OWLSEG_COMPILE=0` skips it (~10% slower per image, starts in seconds).
 
 ## Quick start (Windows)
 
@@ -123,6 +123,7 @@ app.py                    Gradio web UI
 src/owlseg/
   engine.py               OWLv2 boxes -> SAM masks; CUDA, OpenVINO (CPU + Intel GPU) or PyTorch CPU
   fast_attention.py       fused fp32 attention for the CUDA backend
+  fast_decoder.py         SAM mask decoder that shares the per-image work across all boxes (CUDA backend)
   filters.py              keep real objects: drop specks, background, duplicates
   pipeline.py             end-to-end pipeline, progress bar, CLI
   visualize.py            annotated image + scrollable HTML list

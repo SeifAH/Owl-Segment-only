@@ -9,7 +9,8 @@ import json
 import math
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -34,10 +35,17 @@ class Settings:
 
 @dataclass
 class Result:
-    annotated: Image.Image
+    annotated: Image.Image | None  # None until render() when the pipeline ran with draw=False
     list_html: str
     objects: list[dict]
     timings: dict[str, float]
+    _draw: Callable[[], Image.Image] | None = field(default=None, repr=False)
+
+    def render(self) -> Image.Image:
+        """The annotated image, drawn now if it was deferred (e.g. to a background thread)."""
+        if self.annotated is None:
+            self.annotated, self._draw = self._draw(), None
+        return self.annotated
 
     def to_json(self) -> dict:
         return {"total": len(self.objects), "timings_s": self.timings,
@@ -47,7 +55,7 @@ class Result:
         out_dir.mkdir(parents=True, exist_ok=True)
         tag = f"{stem}_{datetime.now():%Y%m%d-%H%M%S}"
         png, js = out_dir / f"{tag}_annotated.png", out_dir / f"{tag}.json"
-        self.annotated.save(png, compress_level=1)  # lossless like the default level, several times faster
+        self.render().save(png, compress_level=1)  # lossless like the default level, several times faster
         js.write_text(json.dumps(self.to_json(), indent=2), encoding="utf-8")
         return png, js
 
@@ -126,8 +134,11 @@ class OwlSamPipeline:
             print(f"[owlseg] backend: {self._engine.backend}")
         return self._engine
 
-    def run(self, image: Image.Image, s: Settings, progress=None) -> Result:
-        """progress: optional callback(fraction 0..1, description), e.g. a gradio.Progress."""
+    def run(self, image: Image.Image, s: Settings, progress=None, draw: bool = True) -> Result:
+        """progress: optional callback(fraction 0..1, description), e.g. a gradio.Progress.
+
+        draw=False leaves the annotated image to Result.render(), so a caller can draw it in another thread while
+        the GPU works on the next image."""
         from .engine import cuda_available, intel_gpu_available, models_converted
         cuda = self._engine.device == "cuda" if self._engine is not None else cuda_available()
         parallel = self._engine.parallel if self._engine is not None else (cuda or intel_gpu_available())
@@ -140,11 +151,11 @@ class OwlSamPipeline:
                        "embed": 0 if parallel else 5, "outline": 2 if parallel else 4, "filter": 1}
         report = _Progress(progress, {k: v for k, v in weights.items() if v})
         try:
-            return self._run(image, s, report, parallel)
+            return self._run(image, s, report, parallel, draw)
         finally:
             report.stop()
 
-    def _run(self, image: Image.Image, s: Settings, report: _Progress, parallel: bool) -> Result:
+    def _run(self, image: Image.Image, s: Settings, report: _Progress, parallel: bool, draw_now: bool) -> Result:
         image = ImageOps.exif_transpose(image).convert("RGB")
         w, h = image.size
         timings: dict[str, float] = {}
@@ -173,11 +184,17 @@ class OwlSamPipeline:
             for i, (_, box, sc, area) in enumerate(found)
         ]
         kept = [m for m, _, _, _ in found]  # each mask cropped to its box
-        annotated = draw(image, objects, kept, show_masks=s.show_masks, label_style=s.label_style)
-        timings["filter+draw"] = time.perf_counter() - t
-        timings = {k: round(v, 2) for k, v in timings.items()}
-        timings["total"] = round(time.perf_counter() - t_start, 2)
-        return Result(annotated, build_list_html(objects, w * h), objects, timings)
+
+        def render() -> Image.Image:
+            return draw(image, objects, kept, show_masks=s.show_masks, label_style=s.label_style)
+
+        res = Result(None, build_list_html(objects, w * h), objects, timings, render)
+        if draw_now:
+            res.render()
+        timings["filter+draw" if draw_now else "filter"] = time.perf_counter() - t
+        res.timings = {k: round(v, 2) for k, v in timings.items()}
+        res.timings["total"] = round(time.perf_counter() - t_start, 2)
+        return res
 
 
 def main() -> None:

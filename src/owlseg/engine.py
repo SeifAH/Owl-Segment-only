@@ -33,7 +33,7 @@ from torchvision.ops import nms
 from .models import OWL_MODEL, SAM_MODEL
 
 BOX_BATCH = 32  # SAM box prompts per decoder call (static shape for OpenVINO; last batch is padded)
-CUDA_BOX_BUCKETS = (16, 32, 64, 128)  # SAM box prompts per decoder call on CUDA, padded up to one of these sizes
+CUDA_BOX_BUCKETS = (16, 32, 48, 64, 96, 128)  # SAM box prompts per decoder call on CUDA, padded up to one of these
 CUDA_BOX_BATCH = CUDA_BOX_BUCKETS[-1]  # (fixed shapes: each size is compiled once)
 CUDA_UPSAMPLE_BATCH = 32  # masks upsampled to full resolution at once on CUDA (bounds GPU memory)
 OWL_SIZE = 960  # OWLv2-base input resolution
@@ -210,6 +210,9 @@ class OwlSam:
         if os.environ.get("OWLSEG_EAGER_ATTENTION") != "1":
             from .fast_attention import use_fused_attention
             use_fused_attention(owl.owlv2.vision_model, self.sam_cuda.vision_encoder)
+        from .fast_decoder import BoxDecoder
+        self.box_decoder_cuda = BoxDecoder(self.sam_cuda.mask_decoder)
+        self.sam_pe = self.sam_cuda.get_image_wide_positional_embeddings()
         f32 = dict(dtype=torch.float32, device=dev)
         self.owl_mean = torch.tensor(self.owl_ip.image_mean, **f32).view(3, 1, 1)
         self.owl_std = torch.tensor(self.owl_ip.image_std, **f32).view(3, 1, 1)
@@ -222,17 +225,16 @@ class OwlSam:
         if os.environ.get("OWLSEG_COMPILE", "1") != "0":
             # fused fp32 kernels, fixed input shapes so nothing recompiles later; torch caches them on disk
             say("Compiling the models for this GPU (first start a few minutes, later about a minute)...")
-            dec = self.sam_cuda.mask_decoder
-            eager = self.owl_cuda, self.sam_cuda.vision_encoder, dec.transformer
+            eager = self.owl_cuda, self.sam_cuda.vision_encoder, self.box_decoder_cuda
             try:
                 self.owl_cuda = torch.compile(self.owl_cuda, dynamic=False)
                 self.sam_cuda.vision_encoder = torch.compile(self.sam_cuda.vision_encoder, dynamic=False)
-                dec.transformer = torch.compile(dec.transformer, dynamic=False)  # the decoder's costly part
+                self.box_decoder_cuda = torch.compile(self.box_decoder_cuda, dynamic=False)
                 self._warm_up(warm)
                 self.backend += ", compiled"
             except Exception as e:  # no C compiler / triton problem: the eager models give the same results
                 print(f"[owlseg] torch.compile unavailable ({e.__class__.__name__}: {e}); running uncompiled.")
-                self.owl_cuda, self.sam_cuda.vision_encoder, dec.transformer = eager
+                self.owl_cuda, self.sam_cuda.vision_encoder, self.box_decoder_cuda = eager
         self.backend += ")"
         say("Warming up the GPU...")
         self._warm_up(warm)
@@ -243,8 +245,13 @@ class OwlSam:
         with torch.inference_mode():
             emb = self.sam_cuda.get_image_embeddings(self._sam_pixels_cuda(image)[0])
             for size in CUDA_BOX_BUCKETS:
-                box = torch.tensor([[[0.0, 0.0, 32.0, 32.0]]], device=emb.device).expand(1, size, 4)
-                self.sam_cuda(image_embeddings=emb, input_boxes=box, multimask_output=False)
+                self._decode(emb, torch.tensor([[0.0, 0.0, 32.0, 32.0]], device=emb.device).expand(size, 4))
+
+    def _decode(self, emb: torch.Tensor, boxes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Boxes (n, 4) in SAM's 1024 frame -> (low-res mask logits (n, 1, 256, 256), predicted IoU (n,))."""
+        sparse, dense = self.sam_cuda.prompt_encoder(input_points=None, input_labels=None,
+                                                     input_boxes=boxes[None], input_masks=None)
+        return self.box_decoder_cuda(emb, self.sam_pe, sparse, dense)
 
     def _load_openvino(self, say) -> None:
         import openvino as ov
@@ -364,9 +371,9 @@ class OwlSam:
             k = len(chunk)
             size = next(c for c in CUDA_BOX_BUCKETS if c >= k)
             chunk = torch.cat([chunk, chunk[-1:].expand(size - k, 4)])  # boxes are decoded independently
-            out = self.sam_cuda(image_embeddings=emb, input_boxes=chunk[None], multimask_output=False)
-            ious[i:i + k] = out.iou_scores[0, :k, 0]
-            low = out.pred_masks[0, :k]  # (k, 1, 256, 256) low-res logits
+            low, iou = self._decode(emb, chunk)
+            ious[i:i + k] = iou[:k]
+            low = low[:k]  # (k, 1, 256, 256) low-res logits
             for j in range(0, len(low), CUDA_UPSAMPLE_BATCH):  # SamImageProcessor.post_process_masks
                 m = F.interpolate(low[j:j + CUDA_UPSAMPLE_BATCH], (self.sam_ip.pad_size["height"],
                                   self.sam_ip.pad_size["width"]), mode="bilinear", align_corners=False)

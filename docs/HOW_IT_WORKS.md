@@ -77,8 +77,10 @@ Limits of the test:
 With an NVIDIA GPU (`engine.py`, `_run_cuda`) the whole image path stays on the GPU, still in strict fp32 (TF32 is switched off; in tests it changed SAM's mask logits by up to 1.1):
 
 - **Preprocessing:** OWLv2's scipy anti-aliasing + resize and SAM's normalise/pad are reproduced on the GPU (max difference to Hugging Face 5e-7). SAM's PIL resize stays on the CPU and overlaps OWLv2 running on the GPU.
-- **Models:** fused attention (`fast_attention.py`) and `torch.compile` with fixed shapes. SAM decodes up to 128 boxes per call, with each batch padded to 16/32/64/128 so nothing recompiles.
+- **Models:** fused attention (`fast_attention.py`) and `torch.compile` with fixed shapes. SAM decodes up to 128 boxes per call, with each batch padded to 16/32/48/64/96/128 so nothing recompiles.
+- **SAM decoder** (`fast_decoder.py`, same maths as Hugging Face's): the image embedding is broadcast instead of copied per box. The first layer's image-side projections are computed once for all boxes, since no box has changed the image side yet, and only the single mask that is used is computed instead of all 4. That is about 35% less decoder time.
 - **Masks:** upsampled and thresholded on the GPU. The filters compute every mask's area and box at once, then test overlaps on box-sized crops. Only the kept objects, cropped to their boxes, are copied back for drawing.
-- **Batch:** the next image is decoded and the previous result written to disk in background threads.
+- **Batch:** the next image is decoded, and earlier results drawn and written to disk, in background threads.
+- Tried and dropped: running OWLv2 and the SAM encoder on two CUDA streams (each already fills the GPU: 212 → 209 ms), and TF32 (changes the results).
 
 Overrides: `OWLSEG_BACKEND=openvino` or `torch` (skip CUDA), `OWLSEG_COMPILE=0` (no `torch.compile`), `OWLSEG_EAGER_ATTENTION=1`.
