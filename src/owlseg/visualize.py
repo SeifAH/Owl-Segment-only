@@ -29,16 +29,20 @@ def font(size: int) -> ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
-def draw(image: Image.Image, objects: list[dict], masks: np.ndarray | None, show_masks: bool = True,
+def draw(image: Image.Image, objects: list[dict], masks: list[np.ndarray] | None, show_masks: bool = True,
          mask_alpha: float = 0.40, label_style: str = "auto") -> Image.Image:
-    """label_style: 'full' (#id score), 'number' (#id), 'none', or 'auto' (number if > 30 objects)."""
+    """masks: one bool mask per object, cropped to the object's box.
+
+    label_style: 'full' (#id score), 'number' (#id), 'none', or 'auto' (number if > 30 objects)."""
     if label_style == "auto":
         label_style = "full" if len(objects) <= 30 else "number"
     base = np.asarray(image.convert("RGB")).astype(np.float32)
     if show_masks and masks is not None:
         for obj, m in zip(objects, masks):
             c = np.array(_hex_to_rgb(obj["color"]), np.float32)
-            base[m] = base[m] * (1 - mask_alpha) + c * mask_alpha
+            x0, y0, x1, y1 = (int(v) for v in obj["box"])
+            region = base[y0:y1, x0:x1]
+            region[m] = region[m] * (1 - mask_alpha) + c * mask_alpha
     out = Image.fromarray(base.clip(0, 255).astype(np.uint8))
 
     d = ImageDraw.Draw(out)

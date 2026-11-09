@@ -34,7 +34,8 @@ Objects are numbered in reading order (row bands top to bottom, then left to rig
 
 | | OWLv2 | SAM encoder | SAM box decoder |
 |---|---|---|---|
-| Laptop with Intel GPU (default) | OpenVINO, CPU | OpenVINO, Intel GPU | OpenVINO, Intel GPU |
+| NVIDIA GPU (CUDA, first choice) | PyTorch, GPU | PyTorch, GPU | PyTorch, GPU |
+| Laptop with Intel GPU | OpenVINO, CPU | OpenVINO, Intel GPU | OpenVINO, Intel GPU |
 | No Intel GPU | OpenVINO, CPU | OpenVINO, CPU | OpenVINO, CPU |
 | OpenVINO fails | PyTorch, CPU | PyTorch, CPU | PyTorch, CPU |
 
@@ -69,3 +70,15 @@ Per frame time in this app: OWLv2 ∥ SAM encoder 4.4–6.4 s, SAM outlines 1.6�
 Limits of the test:
 - One video only.
 - The masks mark only some items (mostly white and clear ones), so extra or false objects are not measured.
+
+
+## 6. The CUDA backend
+
+With an NVIDIA GPU (`engine.py`, `_run_cuda`) the whole image path stays on the GPU, still in strict fp32 (TF32 is switched off; in tests it changed SAM's mask logits by up to 1.1):
+
+- **Preprocessing:** OWLv2's scipy anti-aliasing + resize and SAM's normalise/pad are reproduced on the GPU (max difference to Hugging Face 5e-7). SAM's PIL resize stays on the CPU and overlaps OWLv2 running on the GPU.
+- **Models:** fused attention (`fast_attention.py`) and `torch.compile` with fixed shapes. SAM decodes up to 128 boxes per call, with each batch padded to 16/32/64/128 so nothing recompiles.
+- **Masks:** upsampled and thresholded on the GPU. The filters compute every mask's area and box at once, then test overlaps on box-sized crops. Only the kept objects, cropped to their boxes, are copied back for drawing.
+- **Batch:** the next image is decoded and the previous result written to disk in background threads.
+
+Overrides: `OWLSEG_BACKEND=openvino` or `torch` (skip CUDA), `OWLSEG_COMPILE=0` (no `torch.compile`), `OWLSEG_EAGER_ATTENTION=1`.

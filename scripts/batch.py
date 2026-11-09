@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import csv
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -20,6 +21,12 @@ from PIL import Image
 from owlseg.pipeline import OUTPUT_DIR, OwlSamPipeline, Settings
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+
+
+def _load(path: Path) -> Image.Image:
+    img = Image.open(path)
+    img.load()  # decode now, in the background thread
+    return img
 
 
 def main() -> None:
@@ -42,15 +49,20 @@ def main() -> None:
     print(f"{len(images)} images from {folder}\nResults -> {out}\n", flush=True)
     rows, obj_rows, failed = [], [], []
     t_all = time.perf_counter()
+    # the next image is decoded and the last result written in background threads while the GPU works
+    loader, writer = ThreadPoolExecutor(max_workers=2), ThreadPoolExecutor(max_workers=4)
+    pending, saves = {}, []
     for n, path in enumerate(images, 1):
+        for k in (n - 1, n):  # this image and the next one
+            if k < len(images) and k not in pending:
+                pending[k] = loader.submit(_load, images[k])
         try:
-            img = Image.open(path)
-            res = pipe.run(img, s)
+            res = pipe.run(pending.pop(n - 1).result(), s)
         except Exception as e:  # keep going; report at the end
             print(f"[{n}/{len(images)}] {path.name}: FAILED ({e})", flush=True)
             failed.append(path.name)
             continue
-        res.annotated.save(out / "annotated" / f"{path.stem}.png")
+        saves.append(writer.submit(res.annotated.save, out / "annotated" / f"{path.stem}.png", compress_level=1))
         area = res.annotated.width * res.annotated.height
         rows.append({"image": path.name, "objects": len(res.objects), "time_s": res.timings["total"]})
         for o in res.objects:
@@ -60,6 +72,10 @@ def main() -> None:
                              "mask_area_pct": round(100 * o["mask_area"] / area, 3)})
         print(f"[{n}/{len(images)}] {path.name}: {len(res.objects)} objects in {res.timings['total']} s", flush=True)
 
+    for f in saves:
+        f.result()
+    loader.shutdown()
+    writer.shutdown()
     with open(out / "summary.csv", "w", newline="", encoding="utf-8-sig") as f:  # utf-8-sig: opens cleanly in Excel
         w = csv.DictWriter(f, fieldnames=["image", "objects", "time_s"])
         w.writeheader()

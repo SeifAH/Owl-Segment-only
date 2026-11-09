@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import numpy as np
+import torch
 
 
 def _inside(a: np.ndarray, b: np.ndarray) -> float:
@@ -11,8 +12,20 @@ def _inside(a: np.ndarray, b: np.ndarray) -> float:
     return float(w * h) / max(float((a[2] - a[0]) * (a[3] - a[1])), 1e-6)
 
 
+def _mask_stats(masks: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
+    """Area and inclusive bounding box (x0, y0, x1, y1) of every mask, computed at once (on the GPU with CUDA)."""
+    n, h, w = masks.shape
+    areas = masks.reshape(n, -1).sum(1)
+    rows, cols = masks.any(2), masks.any(1)
+    ys = torch.arange(h, device=masks.device)
+    xs = torch.arange(w, device=masks.device)
+    box = torch.stack([torch.where(cols, xs, w).amin(1), torch.where(rows, ys, h).amin(1),
+                       torch.where(cols, xs, -1).amax(1), torch.where(rows, ys, -1).amax(1)], 1)
+    return areas.cpu().numpy(), box.cpu().numpy()
+
+
 def find_objects(
-    masks: np.ndarray,
+    masks: torch.Tensor,
     scores: np.ndarray,
     min_area_frac: float = 0.002,
     max_area_frac: float = 0.25,
@@ -20,8 +33,8 @@ def find_objects(
     max_span_frac: float = 0.85,
     part_inside: float = 0.9,
     part_score_ratio: float = 0.4,
-) -> list[tuple[np.ndarray, np.ndarray, float]]:
-    """Return [(mask, xyxy_box, score)] for each kept object.
+) -> list[tuple[np.ndarray, np.ndarray, float, int]]:
+    """Return [(mask cropped to its box, xyxy_box, score, area in px)] for each kept object.
 
     Masks are visited best score first. A mask is skipped when it is a speck or too big for one object, spans
     almost the whole image (belt, floor), or lies mostly (> max_overlap) on objects already kept, which
@@ -31,27 +44,32 @@ def find_objects(
     it. It is also dropped when its box lies at least `part_inside` inside a kept object's box and its score is
     below `part_score_ratio` x that object's score. Tested on 6 belt frames: 0.4 removed only true parts, 0.5
     already removed real items (a paper lying on a bottle).
+
+    `masks` is a (N, H, W) bool tensor on any device; only the kept masks, cropped to their boxes, come back.
+    A mask is zero outside its box, so every test on the crop gives the same answer as on the full mask.
     """
     if len(masks) == 0:
         return []
     n, h, w = masks.shape
     img_area = h * w
-    claimed = np.zeros((h, w), dtype=bool)  # pixels of objects already kept
+    areas, bounds = _mask_stats(masks)
+    claimed = torch.zeros((h, w), dtype=torch.bool, device=masks.device)  # pixels of objects already kept
     out = []
     for i in np.argsort(-scores):
-        m = masks[i]
-        a = m.sum()
+        a = int(areas[i])
         if a < min_area_frac * img_area or a > max_area_frac * img_area:
             continue
-        ys, xs = np.nonzero(m)
-        if xs.max() - xs.min() > max_span_frac * w or ys.max() - ys.min() > max_span_frac * h:
+        x0, y0, x1, y1 = (int(v) for v in bounds[i])
+        if x1 - x0 > max_span_frac * w or y1 - y0 > max_span_frac * h:
             continue
-        if (m & claimed).sum() / a > max_overlap:
+        m = masks[i, y0:y1 + 1, x0:x1 + 1]
+        c = claimed[y0:y1 + 1, x0:x1 + 1]
+        if int((m & c).sum()) / a > max_overlap:
             continue
-        box = np.array([xs.min(), ys.min(), xs.max() + 1, ys.max() + 1], np.float32)
+        box = np.array([x0, y0, x1 + 1, y1 + 1], np.float32)
         if any(_inside(box, kept_box) >= part_inside and scores[i] < part_score_ratio * kept_score
-               for _, kept_box, kept_score in out):
+               for _, kept_box, kept_score, _ in out):
             continue
-        out.append((m, box, float(scores[i])))
-        claimed |= m
-    return out
+        c |= m
+        out.append((m, box, float(scores[i]), a))
+    return [(m.cpu().numpy(), box, score, a) for m, box, score, a in out]

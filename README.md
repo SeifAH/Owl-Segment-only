@@ -28,6 +28,26 @@ flowchart LR
 
 ---
 
+## Quick start (Linux + NVIDIA GPU)
+
+```bash
+./run_app.sh                       # web app at http://127.0.0.1:7862
+./run_folder.sh /path/to/images    # batch: annotated images + CSVs in outputs/batch_<timestamp>/
+```
+
+Same setup as on Windows (uv, environment in `~/.venvs/owl-sam-segment`, models in `~/.cache/huggingface`), but with the CUDA build of PyTorch. With an NVIDIA GPU everything runs on the GPU in strict fp32, so the results are the same as on the CPU:
+
+| Workstation (Threadripper 7970X + RTX A5000), per image | original code* | **CUDA backend** |
+|---|---|---|
+| `crushed_cans.jpg` (166 objects) | 14.2 s | **0.87 s** |
+| `kitchen.jpg` (51 objects) | 6.2 s | **0.37 s** |
+| `recycling.jpg` (5 objects) | 4.4 s | **0.27 s** |
+| 2048 × 2048 belt frame | 4.0 s | **0.30 s** |
+
+\* On this machine the original code fell back to PyTorch on the CPU: OpenVINO lists the NVIDIA card as "GPU" but cannot compile for it. Same objects in both columns (boxes and mask areas identical or within float rounding).
+
+The first start compiles the models for the GPU (`torch.compile`, a few minutes once; later starts about 15 s). `OWLSEG_COMPILE=0` skips it (~10% slower per image, starts in seconds).
+
 ## Quick start (Windows)
 
 **Double-click `Run App.bat`.**
@@ -98,9 +118,11 @@ uv run python app.py                                               # the web app
 ```
 Run App.bat               double-click launcher (setup + start the web app)
 Run on Folder.bat         drag a folder onto it: batch-process all images -> CSV + annotated images
+run_app.sh, run_folder.sh the same two launchers for Linux
 app.py                    Gradio web UI
 src/owlseg/
-  engine.py               OWLv2 boxes -> SAM masks; OpenVINO (CPU + Intel GPU) with PyTorch fallback
+  engine.py               OWLv2 boxes -> SAM masks; CUDA, OpenVINO (CPU + Intel GPU) or PyTorch CPU
+  fast_attention.py       fused fp32 attention for the CUDA backend
   filters.py              keep real objects: drop specks, background, duplicates
   pipeline.py             end-to-end pipeline, progress bar, CLI
   visualize.py            annotated image + scrollable HTML list

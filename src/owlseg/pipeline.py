@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
 from PIL import Image, ImageOps
 
 from .filters import find_objects
@@ -48,7 +47,7 @@ class Result:
         out_dir.mkdir(parents=True, exist_ok=True)
         tag = f"{stem}_{datetime.now():%Y%m%d-%H%M%S}"
         png, js = out_dir / f"{tag}_annotated.png", out_dir / f"{tag}.json"
-        self.annotated.save(png)
+        self.annotated.save(png, compress_level=1)  # lossless like the default level, several times faster
         js.write_text(json.dumps(self.to_json(), indent=2), encoding="utf-8")
         return png, js
 
@@ -129,12 +128,16 @@ class OwlSamPipeline:
 
     def run(self, image: Image.Image, s: Settings, progress=None) -> Result:
         """progress: optional callback(fraction 0..1, description), e.g. a gradio.Progress."""
-        from .engine import intel_gpu_available, models_converted
-        parallel = self._engine.parallel if self._engine is not None else intel_gpu_available()
-        # weights = typical seconds per stage on a laptop (Core Ultra 7 155U)
-        load = 0 if self._engine is not None else (3 if models_converted() else 60)
-        weights = {"load": load, "find": 6,
-                   "embed": 0 if parallel else 5, "outline": 2 if parallel else 4, "filter": 1}
+        from .engine import cuda_available, intel_gpu_available, models_converted
+        cuda = self._engine.device == "cuda" if self._engine is not None else cuda_available()
+        parallel = self._engine.parallel if self._engine is not None else (cuda or intel_gpu_available())
+        if cuda:  # relative weights: on an RTX A5000 each stage takes well under a second, loading ~10 s
+            load = 0 if self._engine is not None else 10
+            weights = {"load": load, "find": 1, "embed": 0, "outline": 1, "filter": 1}
+        else:  # weights = typical seconds per stage on a laptop (Core Ultra 7 155U)
+            load = 0 if self._engine is not None else (3 if models_converted() else 60)
+            weights = {"load": load, "find": 6,
+                       "embed": 0 if parallel else 5, "outline": 2 if parallel else 4, "filter": 1}
         report = _Progress(progress, {k: v for k, v in weights.items() if v})
         try:
             return self._run(image, s, report, parallel)
@@ -166,10 +169,10 @@ class OwlSamPipeline:
         found.sort(key=lambda f: (int(f[1][1]) // band, float(f[1][0])))
         objects = [
             {"id": i + 1, "score": round(min(sc, 1.0), 4), "box": [round(float(v), 1) for v in box],
-             "mask_area": int(m.sum()), "color": PALETTE[i % len(PALETTE)]}
-            for i, (m, box, sc) in enumerate(found)
+             "mask_area": area, "color": PALETTE[i % len(PALETTE)]}
+            for i, (_, box, sc, area) in enumerate(found)
         ]
-        kept = np.stack([m for m, _, _ in found]) if found else None
+        kept = [m for m, _, _, _ in found]  # each mask cropped to its box
         annotated = draw(image, objects, kept, show_masks=s.show_masks, label_style=s.label_style)
         timings["filter+draw"] = time.perf_counter() - t
         timings = {k: round(v, 2) for k, v in timings.items()}
