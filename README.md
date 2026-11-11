@@ -2,8 +2,8 @@
 
 You give it an image full of objects. It returns:
 
-- the image with a **numbered box and a coloured mask on every object**, and
-- a **scrollable list** beside the image with the total object count and every object (size and score).
+- the image with **every object highlighted in light blue** and numbered, and
+- a **scrollable list** beside the image with the total object count and every object (size and score), each with a tick box to show or hide its highlight.
 
 There is no prompt and no naming. **OWLv2** puts a box around everything that looks like a whole object, and **SAM** (Segment Anything) outlines the object inside each box. This replaces the grid of points used by `sam-segment-only`. On the test video it finds more of the items and runs faster:
 
@@ -43,8 +43,8 @@ Your browser opens at **http://127.0.0.1:7862**. Keep the console window open wh
 1. Drop an image into **Input image** and press **Find objects**.
 2. Wait about 8–10 s on a laptop with an Intel integrated GPU. The progress bar shows each step.
 3. Read the results:
-   - **Middle:** every object has its own colour and number. With more than 30 objects only the numbers are shown.
-   - **Right:** the scrollable list: *Total objects detected*, then each object with its size (% of the image) and score.
+   - **Middle:** every ticked object is highlighted in light blue with its number. With more than 30 objects only the numbers are shown.
+   - **Right:** *Total objects detected*, a **Mask all** box, and the scrollable list: each object with its size (% of the image) and score. Untick an object to remove its highlight, tick it to bring it back. **Mask all** ticks or unticks every object at once.
    - **Below:** the time per stage and a JSON file with all objects.
 
 Each run also saves `outputs/<image>_<timestamp>_annotated.png` and a matching `.json`.
@@ -56,7 +56,7 @@ Each run also saves `outputs/<image>_<timestamp>_annotated.png` and a matching `
 | Objectness threshold | How sure OWLv2 must be that a box holds a whole object (default 0.1). | Lower it if objects are missed; raise it if there is junk. |
 | Min object size | Smallest object kept, as % of the image. | Lower it for tiny items. |
 | Max object size | Larger regions are treated as background. | Raise it when single objects are big in the frame. |
-| Show masks / Box labels | Display options. | Crowded images. |
+| Object labels | Text on each highlighted object: `#id score`, number only, or none. | Crowded images. |
 
 The score of an object is SAM's mask quality × OWLv2's objectness.
 
@@ -103,7 +103,7 @@ src/owlseg/
   engine.py               OWLv2 boxes -> SAM masks; OpenVINO (CPU + Intel GPU) with PyTorch fallback
   filters.py              keep real objects: drop specks, background, duplicates
   pipeline.py             end-to-end pipeline, progress bar, CLI
-  visualize.py            annotated image + scrollable HTML list
+  visualize.py            light-blue highlight of the selected objects
   models.py               model ids
 scripts/
   setup.bat               shared setup used by both launchers (uv, environment, models)

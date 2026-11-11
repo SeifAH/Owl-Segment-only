@@ -17,7 +17,7 @@ import numpy as np
 from PIL import Image, ImageOps
 
 from .filters import find_objects
-from .visualize import PALETTE, build_list_html, draw
+from .visualize import draw
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
@@ -29,20 +29,20 @@ class Settings:
     min_area: float = 0.002        # fraction of the image
     max_area: float = 0.25         # fraction of the image; larger regions count as background
     max_overlap: float = 0.5       # skip a mask lying this much on objects already kept (duplicates, parts)
-    show_masks: bool = True
-    label_style: str = "auto"      # auto | full | number | none
+    label_style: str = "auto"      # auto | full | number | none (numbers on the highlighted objects)
 
 
 @dataclass
 class Result:
-    annotated: Image.Image
-    list_html: str
+    annotated: Image.Image         # every object highlighted
     objects: list[dict]
     timings: dict[str, float]
+    image: Image.Image             # the input, for redrawing with a different selection
+    masks: np.ndarray | None       # (n, h, w) bool, one per object, same order as objects
 
     def to_json(self) -> dict:
         return {"total": len(self.objects), "timings_s": self.timings,
-                "objects": [{k: v for k, v in o.items() if k != "color"} for o in self.objects]}
+                "objects": self.objects}
 
     def save(self, stem: str, out_dir: Path = OUTPUT_DIR) -> tuple[Path, Path]:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -143,7 +143,7 @@ class OwlSamPipeline:
 
     def _run(self, image: Image.Image, s: Settings, report: _Progress, parallel: bool) -> Result:
         image = ImageOps.exif_transpose(image).convert("RGB")
-        w, h = image.size
+        h = image.height
         timings: dict[str, float] = {}
         t_start = time.perf_counter()
         if self._engine is None:
@@ -166,15 +166,15 @@ class OwlSamPipeline:
         found.sort(key=lambda f: (int(f[1][1]) // band, float(f[1][0])))
         objects = [
             {"id": i + 1, "score": round(min(sc, 1.0), 4), "box": [round(float(v), 1) for v in box],
-             "mask_area": int(m.sum()), "color": PALETTE[i % len(PALETTE)]}
+             "mask_area": int(m.sum())}
             for i, (m, box, sc) in enumerate(found)
         ]
         kept = np.stack([m for m, _, _ in found]) if found else None
-        annotated = draw(image, objects, kept, show_masks=s.show_masks, label_style=s.label_style)
+        annotated = draw(image, objects, kept, label_style=s.label_style)
         timings["filter+draw"] = time.perf_counter() - t
         timings = {k: round(v, 2) for k, v in timings.items()}
         timings["total"] = round(time.perf_counter() - t_start, 2)
-        return Result(annotated, build_list_html(objects, w * h), objects, timings)
+        return Result(annotated, objects, timings, image, kept)
 
 
 def main() -> None:
