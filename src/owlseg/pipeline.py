@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageOps
 
+from .engine import TILE
 from .filters import find_objects
 from .visualize import draw
 
@@ -38,7 +39,7 @@ class Result:
     objects: list[dict]
     timings: dict[str, float]
     image: Image.Image             # the input, for redrawing with a different selection
-    masks: np.ndarray | None       # (n, h, w) bool, one per object, same order as objects
+    masks: list                    # per object (x0, y0, mask cropped to its box), same order as objects
 
     def to_json(self) -> dict:
         return {"total": len(self.objects), "timings_s": self.timings,
@@ -107,10 +108,11 @@ class _Progress:
             self._tick_id += 1
 
 
+STEP_SHARE = {"find": (0.0, 0.8), "embed": (0.45, 0.35), "outline": (0.8, 0.2)}  # (start, length) per tile
 STEP_TEXT = {
-    "find": "Step 1/2 · OWLv2: looking for objects{extra}...",
-    "embed": "Step 1/2 · SAM: analysing the image...",
-    "outline": "Step 2/2 · SAM: outlining each object ({pct}%)...",
+    "find": "OWLv2: looking for objects{extra}{tile}...",
+    "embed": "SAM: analysing the image{tile}...",
+    "outline": "SAM: outlining each object{tile} ({pct}%)...",
 }
 
 
@@ -129,12 +131,12 @@ class OwlSamPipeline:
 
     def run(self, image: Image.Image, s: Settings, progress=None) -> Result:
         """progress: optional callback(fraction 0..1, description), e.g. a gradio.Progress."""
-        from .engine import intel_gpu_available, models_converted
+        from .engine import intel_gpu_available, models_converted, tile_grid
         parallel = self._engine.parallel if self._engine is not None else intel_gpu_available()
-        # weights = typical seconds per stage on a laptop (Core Ultra 7 155U)
+        n_tiles = len(tile_grid(*image.size))
+        # weights = typical seconds per stage on a laptop (Core Ultra 7 155U); "work" covers every tile
         load = 0 if self._engine is not None else (3 if models_converted() else 60)
-        weights = {"load": load, "find": 6,
-                   "embed": 0 if parallel else 5, "outline": 2 if parallel else 4, "filter": 1}
+        weights = {"load": load, "work": n_tiles * (8 if parallel else 15), "filter": max(1, n_tiles // 2)}
         report = _Progress(progress, {k: v for k, v in weights.items() if v})
         try:
             return self._run(image, s, report, parallel)
@@ -143,7 +145,7 @@ class OwlSamPipeline:
 
     def _run(self, image: Image.Image, s: Settings, report: _Progress, parallel: bool) -> Result:
         image = ImageOps.exif_transpose(image).convert("RGB")
-        h = image.height
+        w, h = image.size
         timings: dict[str, float] = {}
         t_start = time.perf_counter()
         if self._engine is None:
@@ -154,27 +156,32 @@ class OwlSamPipeline:
 
         extra = " while SAM analyses the image" if parallel else ""
 
-        def on_step(stage, frac):
-            report(stage, STEP_TEXT[stage].format(extra=extra, pct=round(100 * frac)), frac)
+        def on_step(stage, frac, tile_no, n_tiles):
+            where = f" (part {tile_no} of {n_tiles})" if n_tiles > 1 else ""
+            # share of one tile's time: OWLv2 (+ SAM encoder) first, then the outlines
+            start, span = STEP_SHARE[stage] if parallel or stage != "find" else (0.0, 0.45)
+            report("work", STEP_TEXT[stage].format(extra=extra, tile=where, pct=round(100 * frac)),
+                   (tile_no - 1 + start + span * frac) / n_tiles)
 
-        masks, scores, _ = self._engine.run(image, s.min_objectness, report=on_step, timings=timings)
+        cands = self._engine.run(image, s.min_objectness, report=on_step, timings=timings)
 
         report("filter", "Removing background and duplicates, drawing...")
         t = time.perf_counter()
-        found = find_objects(masks, scores, s.min_area, s.max_area, s.max_overlap)
-        band = max(h // 12, 1)  # reading order: row bands top-to-bottom, then left-to-right
-        found.sort(key=lambda f: (int(f[1][1]) // band, float(f[1][0])))
+        ref = (min(w, TILE), min(h, TILE))  # what the models saw at once: sizes are relative to that
+        found = find_objects(cands, (w, h), ref, s.min_area, s.max_area, s.max_overlap)
+        band = max(ref[1] // 12, 1)  # reading order: row bands top-to-bottom, then left-to-right
+        found.sort(key=lambda c: (int(c.box[1]) // band, int(c.box[0])))
         objects = [
-            {"id": i + 1, "score": round(min(sc, 1.0), 4), "box": [round(float(v), 1) for v in box],
-             "mask_area": int(m.sum())}
-            for i, (m, box, sc) in enumerate(found)
+            {"id": i + 1, "score": round(min(c.score, 1.0), 4), "box": [int(v) for v in c.box],
+             "mask_area": int(c.mask.sum())}
+            for i, c in enumerate(found)
         ]
-        kept = np.stack([m for m, _, _ in found]) if found else None
-        annotated = draw(image, objects, kept, label_style=s.label_style)
+        masks = [(int(c.box[0]), int(c.box[1]), c.mask) for c in found]
+        annotated = draw(image, objects, masks, label_style=s.label_style)
         timings["filter+draw"] = time.perf_counter() - t
         timings = {k: round(v, 2) for k, v in timings.items()}
         timings["total"] = round(time.perf_counter() - t_start, 2)
-        return Result(annotated, objects, timings, image, kept)
+        return Result(annotated, objects, timings, image, masks)
 
 
 def main() -> None:

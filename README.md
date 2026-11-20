@@ -42,6 +42,7 @@ Your browser opens at **http://127.0.0.1:7862**. Keep the console window open wh
 
 1. Drop an image into **Input image** and press **Find objects**.
 2. Wait about 8–10 s on a laptop with an Intel integrated GPU. The progress bar shows each step.
+   Images larger than 2048 px (e.g. long line-scan belt recordings) are processed in overlapping 2048 × 2048 parts, about 8 s each on that laptop: a 2048 × 10 000 recording has 7 parts. Tall images are shown full width; scroll down in the result.
 3. Read the results:
    - **Middle:** every ticked object is highlighted in light blue with its number. With more than 30 objects only the numbers are shown.
    - **Right:** *Total objects detected*, a **Mask all** box, and the scrollable list: each object with its size (% of the image) and score. Untick an object to remove its highlight, tick it to bring it back. **Mask all** ticks or unticks every object at once.
