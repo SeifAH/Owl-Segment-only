@@ -5,9 +5,6 @@ OWLv2 is an open-vocabulary detector; here only its image half runs. For each of
 independent of any class name. Boxes above `min_objectness` survive non-maximum suppression and are passed to
 SAM as box prompts; SAM returns one mask per box.
 
-Images larger than TILE px (long line-scan belt recordings) run tile by tile, so neither model has to shrink
-them by 10-40x; see run() and docs/HOW_IT_WORKS.md.
-
 Where each model runs (chosen automatically, fastest first):
   * OWLv2 on the CPU and SAM on the Intel integrated GPU, both via OpenVINO in fp32, run at the same time
     (~8 s per image on a Core Ultra 7 155U).
@@ -24,11 +21,8 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from dataclasses import dataclass
-
 import numpy as np
 import torch
-import torch.nn.functional as F
 from PIL import Image
 from torchvision.ops import nms
 
@@ -36,19 +30,8 @@ from .models import OWL_MODEL, SAM_MODEL
 
 BOX_BATCH = 32  # SAM box prompts per decoder call (static shape for OpenVINO; last batch is padded)
 OWL_SIZE = 960  # OWLv2-base input resolution
-TILE = 2048  # images larger than this are processed in tiles of TILE x TILE px ...
-TILE_OVERLAP = 512  # ... overlapping by this much; objects cut by a tile edge are stitched back together
 OV_CACHE = Path(os.environ.get("OWLSEG_OV_CACHE", Path.home() / ".cache" / "owlseg-openvino"))
 F32 = {"INFERENCE_PRECISION_HINT": "f32"}
-
-
-@dataclass
-class Candidate:
-    """One SAM mask for one OWLv2 box, in image px."""
-    box: np.ndarray       # x0, y0, x1, y1 (int) of the mask
-    mask: np.ndarray      # bool, cropped to box: shape (y1 - y0, x1 - x0)
-    score: float          # SAM mask quality x OWLv2 objectness
-    cut: tuple = (False, False, False, False)  # mask touches an inner tile edge on the left/top/right/bottom
 
 
 # ---- export wrappers: plain tensor in / tensors out ----------------------------------------------------
@@ -203,98 +186,51 @@ class OwlSam:
         k = nms(boxes, obj, nms_iou)
         return boxes[k].numpy(), obj[k].numpy()
 
-    def _outline(self, emb, boxes: np.ndarray, tile_hw: tuple[int, int], reshaped_hw: tuple[int, int], report):
-        """SAM masks for box prompts (tile px). Returns [(box x0,y0,x1,y1 int, mask cropped to that box, iou)].
-
-        Masks are upsampled only inside each object's box: a full-size mask per object would need gigabytes on a
-        long belt recording.
-        """
-        h, w = tile_hw
-        rh, rw = reshaped_hw
-        scale = 1024 / max(h, w)  # SAM resizes the longest side to 1024
-        prompts = (boxes * scale).astype(np.float32)
-        out = []
-        n_batches = max(1, -(-len(prompts) // BOX_BATCH))
-        for k, i in enumerate(range(0, len(prompts), BOX_BATCH)):
-            report(k / n_batches)
-            chunk = prompts[i:i + BOX_BATCH]
-            n = len(chunk)
-            if n < BOX_BATCH:
-                chunk = np.concatenate([chunk, np.repeat(chunk[-1:], BOX_BATCH - n, 0)])
-            r = self.box_decoder([emb, chunk[None]])
-            iou, low = np.asarray(r[0])[0, :n, 0], np.asarray(r[1])[0, :n, 0]  # low-res logits (n, 256, 256)
-            up = F.interpolate(torch.from_numpy(low)[:, None], size=(1024, 1024), mode="bilinear",
-                               align_corners=False)[:, 0, :rh, :rw]  # (n, rh, rw) logits, padding removed
-            for j in range(n):
-                ys, xs = torch.nonzero(up[j] > 0, as_tuple=True)
-                if len(ys) == 0:
-                    out.append(None)
-                    continue
-                y0, y1, x0, x1 = int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1
-                Y0, Y1 = int(y0 / scale), min(h, int(np.ceil(y1 / scale)))
-                X0, X1 = int(x0 / scale), min(w, int(np.ceil(x1 / scale)))
-                crop = F.interpolate(up[j, y0:y1, x0:x1][None, None], size=(Y1 - Y0, X1 - X0), mode="bilinear",
-                                     align_corners=False)[0, 0] > 0
-                out.append((np.array([X0, Y0, X1, Y1]), crop.numpy(), float(iou[j])))
-        report(1.0)
-        return out
-
     def run(self, image: Image.Image, min_objectness: float = 0.1, nms_iou: float = 0.7, report=None,
-            timings: dict | None = None, tile: int = TILE, overlap: int = TILE_OVERLAP) -> list[Candidate]:
-        """Every object OWLv2 proposes, outlined by SAM, as Candidates in image px.
+            timings: dict | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return (masks (N, H, W) bool, scores (N,), objectness (N,)) for every box OWLv2 proposes.
 
-        Images larger than `tile` are processed in overlapping tiles so OWLv2 (960 px input) and SAM (1024 px)
-        see objects near full resolution; a whole 2048 x 30000 belt recording squeezed into 960 px loses almost
-        every object. score = SAM's predicted mask quality x OWLv2 objectness.
-        report(stage, fraction within the tile, tile number, number of tiles) drives a progress bar.
+        score = SAM's predicted mask quality x OWLv2 objectness. report(stage, fraction) drives a progress bar.
         """
         import time
 
         report = report or (lambda stage, frac: None)
         t = timings if timings is not None else {}
-        for k in (("owl+sam_embed",) if self.parallel else ("owl", "sam_embed")) + ("sam_outline",):
-            t.setdefault(k, 0.0)
         w, h = image.size
-        tiles = tile_grid(w, h, tile, overlap)
-        out: list[Candidate] = []
-        for n, (x0, y0, x1, y1) in enumerate(tiles):
-            sub = image if len(tiles) == 1 else image.crop((x0, y0, x1, y1))
-            step = lambda stage, frac, n=n: report(stage, frac, n + 1, len(tiles))  # noqa: E731
+        t0 = time.perf_counter()
+        report("find", 0.0)
+        if self.parallel:  # SAM encodes the image on the GPU while OWLv2 looks for objects on the CPU
+            embed_job = self._pool.submit(self._embed, image)
+            boxes, obj = self._find_boxes(image, min_objectness, nms_iou)
+            emb, orig, reshaped = embed_job.result()
+            t["owl+sam_embed"] = time.perf_counter() - t0
+        else:
+            boxes, obj = self._find_boxes(image, min_objectness, nms_iou)
+            t["owl"] = time.perf_counter() - t0
+            report("embed", 0.0)
             t0 = time.perf_counter()
-            step("find", 0.0)
-            if self.parallel:  # SAM encodes the tile on the GPU while OWLv2 looks for objects on the CPU
-                embed_job = self._pool.submit(self._embed, sub)
-                boxes, obj = self._find_boxes(sub, min_objectness, nms_iou)
-                emb, _, reshaped = embed_job.result()
-                t["owl+sam_embed"] += time.perf_counter() - t0
-            else:
-                boxes, obj = self._find_boxes(sub, min_objectness, nms_iou)
-                t["owl"] += time.perf_counter() - t0
-                step("embed", 0.0)
-                t0 = time.perf_counter()
-                emb, _, reshaped = self._embed(sub)
-                t["sam_embed"] += time.perf_counter() - t0
-            t0 = time.perf_counter()
-            rh, rw = (int(v) for v in reshaped[0])
-            masks = self._outline(emb, boxes, (y1 - y0, x1 - x0), (rh, rw), lambda f: step("outline", f))
-            t["sam_outline"] += time.perf_counter() - t0
-            for found, ob in zip(masks, obj):
-                if found is None:
-                    continue
-                b, m, iou = found
-                # which sides of the mask touch a tile edge that lies inside the image (object may be cut there)
-                cut = (x0 > 0 and b[0] <= 1, y0 > 0 and b[1] <= 1,
-                       x1 < w and b[2] >= x1 - x0 - 1, y1 < h and b[3] >= y1 - y0 - 1)
-                out.append(Candidate(b + np.array([x0, y0, x0, y0]), m, iou * float(ob), cut))
-        return out
+            emb, orig, reshaped = self._embed(image)
+            t["sam_embed"] = time.perf_counter() - t0
 
-
-def tile_grid(w: int, h: int, tile: int = TILE, overlap: int = TILE_OVERLAP) -> list[tuple[int, int, int, int]]:
-    """Overlapping tiles (x0, y0, x1, y1) covering the image; one tile when it is no bigger than `tile`."""
-    def starts(n):
-        if n <= tile:
-            return [0]
-        step = tile - overlap
-        return list(range(0, n - tile, step)) + [n - tile]
-    tw, th = min(w, tile), min(h, tile)
-    return [(x, y, x + tw, y + th) for y in starts(h) for x in starts(w)]
+        t0 = time.perf_counter()
+        prompts = self.sam_proc._normalize_coordinates(1024, boxes.astype(np.float32), (h, w), is_bounding_box=True)
+        prompts = prompts.reshape(-1, 4).astype(np.float32)
+        masks, ious = [], []
+        n_batches = max(1, -(-len(prompts) // BOX_BATCH))
+        for k, i in enumerate(range(0, len(prompts), BOX_BATCH)):
+            report("outline", k / n_batches)
+            chunk = prompts[i:i + BOX_BATCH]
+            n = len(chunk)
+            if n < BOX_BATCH:
+                chunk = np.concatenate([chunk, np.repeat(chunk[-1:], BOX_BATCH - n, 0)])
+            r = self.box_decoder([emb, chunk[None]])
+            iou, low = r[0], r[1]
+            ious.append(iou[0, :n, 0])
+            # (1, n, 1, 256, 256) low-res logits -> (n, 1, H, W) full-res logits
+            full = self.sam_ip.post_process_masks(torch.from_numpy(low[:, :n]), orig, reshaped, binarize=False)[0]
+            masks.append((full[:, 0] > 0).numpy())
+        report("outline", 1.0)
+        t["sam_outline"] = time.perf_counter() - t0
+        if not masks:
+            return np.zeros((0, h, w), bool), np.zeros(0, np.float32), np.zeros(0, np.float32)
+        return np.concatenate(masks), np.concatenate(ious) * obj, obj

@@ -6,41 +6,31 @@
 
 This app asks a detector first **where the objects are**, then asks SAM to outline each one. A box prompt tells SAM exactly which object is meant, so touching items stay separate.
 
-## 2. Large images: tiles
-
-Both models see a small image: OWLv2 960 × 960, SAM 1024 × 1024. A whole line-scan recording (2048 px wide, 10 000–40 000 px long) squeezed into that is shrunk 10–40×; items become a few pixels and are lost. On five hand-checked crops of the VisionFeed recordings the whole-image approach found 48 of 96 items, and 0 of 30 in the two 29 440 px recordings.
-
-Images larger than 2048 px are therefore cut into 2048 × 2048 tiles that overlap by 512 px (`engine.TILE`, `engine.TILE_OVERLAP`). Each tile runs through OWLv2 and SAM on its own (≈ 2× shrink only), and masks are mapped back to the image. An object cut by a tile edge shows up once per tile; pieces whose masks cover the same pixels in the overlap are joined again (`filters.stitch`). Images up to 2048 px are one tile, as before.
-
-Same five crops with tiles: **85 of 96 items found (88.5%)**, up from 50%. The remaining misses are mostly clear film and translucent bags on the dark belt. Tiling also shows more parts (caps, labels) as their own objects: 43 boxes on those crops that match no item, against 1 before.
-
-Masks are kept cropped to each object's box. A full-size mask per object would need gigabytes on a long recording.
-
-## 3. OWLv2 without class names
+## 2. OWLv2 without class names
 
 OWLv2 (`google/owlv2-base-patch16-ensemble`) is an open-vocabulary detector: normally you give it class names. It also has an **objectness head**: for each of its 60 × 60 = 3600 image patches it predicts one box and a score for "there is a whole object here", without any class name. Only the image half of the model runs here (image encoder, objectness head, box head); the text half is not loaded.
 
 Steps:
-1. The tile is padded to a square and resized to 960 × 960.
+1. The image is padded to a square and resized to 960 × 960.
 2. OWLv2 returns 3600 boxes with objectness scores.
 3. Boxes with objectness ≥ 0.1 are kept; non-maximum suppression (IoU 0.7) removes near-duplicates.
 
-## 4. SAM: one mask per box
+## 3. SAM: one mask per box
 
-SAM ViT-B encodes each tile once (1024 × 1024 → 64 × 64 × 256 embedding). The boxes are then decoded in batches of 32, one mask per box (`multimask_output=False`). Each mask is upsampled to full resolution only inside its own box.
+SAM ViT-B encodes the image once (1024 × 1024 → 64 × 64 × 256 embedding). The boxes are then decoded in batches of 32, one mask per box (`multimask_output=False`). Masks are upsampled to full resolution on the CPU.
 
 Score of an object = SAM's predicted mask quality × OWLv2 objectness.
 
-## 5. Filters (`filters.py`)
+## 4. Filters (`filters.py`)
 
 Masks are visited best score first. A mask is dropped when it is:
-- smaller than 0.2% or larger than 25% of the image (of one tile, for tiled images),
-- wider or taller than 85% of the image or tile (belt, floor),
+- smaller than 0.2% or larger than 25% of the image,
+- wider or taller than 85% of the image (belt, floor),
 - more than 50% on top of objects already kept (a second box on the same object, or a part of it).
 
 Objects are numbered in reading order (row bands top to bottom, then left to right).
 
-## 6. Where each model runs
+## 5. Where each model runs
 
 | | OWLv2 | SAM encoder | SAM box decoder |
 |---|---|---|---|
@@ -63,7 +53,7 @@ Overrides: `OWLSEG_DEVICE=cpu` (skip the GPU), `OWLSEG_BACKEND=torch` (skip Open
 
 The first start converts the three models to OpenVINO format and saves them in `%USERPROFILE%\.cache\owlseg-openvino` (about a minute); compiled GPU kernels are cached there too.
 
-## 7. Measured results
+## 6. Measured results
 
 13 frames (1, 5, …, 49) of `before-video-002`, scored against the ground-truth masks. Each white region of a mask is one target item (149 in total). An item counts as found when one predicted object overlaps it with IoU ≥ 0.5.
 

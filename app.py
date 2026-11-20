@@ -22,9 +22,6 @@ CSS = """
 #ov-wrap .ov-box{position:relative;display:inline-block;line-height:0}
 #ov-wrap .ov-base{display:block;max-width:100%;max-height:640px}
 #ov-wrap .ov{position:absolute;pointer-events:none}
-#ov-wrap.tall{display:block;max-height:640px;min-height:0;overflow-y:auto}
-#ov-wrap.tall .ov-box{display:block}
-#ov-wrap.tall .ov-base{width:100%;max-height:none}
 """
 EMPTY_VIEW = '<div id="ov-wrap" style="opacity:.6">The highlighted objects appear here.</div>'
 

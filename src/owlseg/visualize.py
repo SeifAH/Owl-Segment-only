@@ -15,7 +15,6 @@ from PIL import Image, ImageDraw, ImageFont
 HIGHLIGHT = (79, 195, 247)   # light blue fill
 OUTLINE = (2, 119, 189)      # darker blue edge, keeps touching objects apart
 HIGHLIGHT_ALPHA = 0.5
-MAX_VIEW_PX = 12000  # longest side of the image sent to the browser
 
 
 def font(size: int) -> ImageFont.ImageFont:
@@ -40,10 +39,7 @@ def _edge(m: np.ndarray, width: int) -> np.ndarray:
     return m & ~inner
 
 
-Masks = list  # per object: (x0, y0, bool mask cropped to the object's box), see pipeline.Result
-
-
-def draw(image: Image.Image, objects: list[dict], masks: Masks | None,
+def draw(image: Image.Image, objects: list[dict], masks: np.ndarray | None,
          selected: Iterable[int] | None = None, label_style: str = "auto") -> Image.Image:
     """Highlight the objects whose id is in `selected` (None = all) in light blue.
 
@@ -53,18 +49,17 @@ def draw(image: Image.Image, objects: list[dict], masks: Masks | None,
     if label_style == "auto":
         label_style = "full" if len(objects) <= 30 else "number"
     sel = {o["id"] for o in objects} if selected is None else set(selected)
-    shown = [(o, m) for o, m in zip(objects, masks or []) if o["id"] in sel]
+    shown = [(o, m) for o, m in zip(objects, masks if masks is not None else []) if o["id"] in sel]
 
-    base = np.array(image.convert("RGB"))
+    base = np.asarray(image.convert("RGB")).astype(np.float32)
     h, w = base.shape[:2]
     edge_w = max(1, round(min(w, h) / 500))
     fill = np.array(HIGHLIGHT, np.float32)
-    for _, (mx, my, m) in shown:
-        reg = base[my:my + m.shape[0], mx:mx + m.shape[1]]
-        reg[m] = (reg[m] * (1 - HIGHLIGHT_ALPHA) + fill * HIGHLIGHT_ALPHA).astype(np.uint8)
-    for _, (mx, my, m) in shown:
-        base[my:my + m.shape[0], mx:mx + m.shape[1]][_edge(m, edge_w)] = OUTLINE
-    out = Image.fromarray(base)
+    for _, m in shown:
+        base[m] = base[m] * (1 - HIGHLIGHT_ALPHA) + fill * HIGHLIGHT_ALPHA
+    for _, m in shown:
+        base[_edge(m, edge_w)] = OUTLINE
+    out = Image.fromarray(base.clip(0, 255).astype(np.uint8))
 
     if label_style != "none" and shown:
         d = ImageDraw.Draw(out)
@@ -84,7 +79,7 @@ def _data_uri(img: Image.Image, fmt: str, **kw) -> str:
     return f"data:image/{fmt.lower()};base64,{base64.b64encode(buf.getvalue()).decode()}"
 
 
-def viewer_html(image: Image.Image, objects: list[dict], masks: Masks | None,
+def viewer_html(image: Image.Image, objects: list[dict], masks: np.ndarray | None,
                 selected: Iterable[int] | None = None, label_style: str = "auto") -> str:
     """The image with one ready-made transparent highlight layer per object; only `selected` (None = all) shown.
 
@@ -99,14 +94,12 @@ def viewer_html(image: Image.Image, objects: list[dict], masks: Masks | None,
     f = font(max(12, round(min(w, h) / 50)))
     stroke = max(1, round(min(w, h) / 600))
     pad = f.size if hasattr(f, "size") else 12  # room around the object so its label is not cut off
-    shrink = min(1.0, MAX_VIEW_PX / max(w, h))  # keep the page light: very long images are sent smaller
     layers = []
-    for o, (mx, my, m) in zip(objects, masks or []):
+    for o, m in zip(objects, masks if masks is not None else []):
         bx0, by0, bx1, by1 = o["box"]
         x0, y0 = max(int(bx0) - pad, 0), max(int(by0) - pad, 0)
         x1, y1 = min(int(bx1) + pad, w), min(int(by1) + pad, h)
-        crop = np.zeros((y1 - y0, x1 - x0), bool)  # the mask, with room around it for the label
-        crop[my - y0:my - y0 + m.shape[0], mx - x0:mx - x0 + m.shape[1]] = m
+        crop = m[y0:y1, x0:x1]
         rgba = np.zeros((*crop.shape, 4), np.uint8)
         rgba[crop] = (*HIGHLIGHT, round(255 * HIGHLIGHT_ALPHA))
         rgba[_edge(crop, edge_w)] = (*OUTLINE, 255)
@@ -115,19 +108,12 @@ def viewer_html(image: Image.Image, objects: list[dict], masks: Masks | None,
             text = f"#{o['id']} {o['score']:.2f}" if label_style == "full" else f"{o['id']}"
             ImageDraw.Draw(layer).text(((bx0 + bx1) / 2 - x0, (by0 + by1) / 2 - y0), text, font=f, anchor="mm",
                                        fill="#ffffff", stroke_width=stroke, stroke_fill="#01304d")
-        if shrink < 1:
-            layer = layer.resize((max(1, round(layer.width * shrink)), max(1, round(layer.height * shrink))))
         pos = (f"left:{100 * x0 / w:.4f}%;top:{100 * y0 / h:.4f}%;"
                f"width:{100 * (x1 - x0) / w:.4f}%;height:{100 * (y1 - y0) / h:.4f}%"
                + ("" if sel is None or o["id"] in sel else ";display:none"))
         layers.append(f'<img class="ov" data-id="{o["id"]}" style="{pos}" src="{_data_uri(layer, "PNG")}">')
-    shown = image.convert("RGB")
-    if shrink < 1:
-        shown = shown.resize((round(w * shrink), round(h * shrink)))
-    base = _data_uri(shown, "JPEG", quality=90)
-    tall = " tall" if h > 2 * w else ""  # long belt recording: full width, scroll down instead of shrinking
-    return (f'<div id="ov-wrap" class="{tall.strip()}"><div class="ov-box"><img class="ov-base" src="{base}">'
-            f'{"".join(layers)}</div></div>')
+    base = _data_uri(image.convert("RGB"), "JPEG", quality=90)
+    return f'<div id="ov-wrap"><div class="ov-box"><img class="ov-base" src="{base}">{"".join(layers)}</div></div>'
 
 
 def object_label(o: dict, image_area: int) -> str:

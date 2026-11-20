@@ -1,12 +1,7 @@
-"""Turn the raw OWLv2+SAM masks into a list of objects: drop specks, background and duplicates.
-
-Masks are cropped to their own box (see engine.Candidate), so memory stays small on long belt recordings.
-"""
+"""Turn the raw OWLv2+SAM masks into a list of objects: drop specks, background and duplicates."""
 from __future__ import annotations
 
 import numpy as np
-
-from .engine import Candidate
 
 
 def _inside(a: np.ndarray, b: np.ndarray) -> float:
@@ -16,77 +11,47 @@ def _inside(a: np.ndarray, b: np.ndarray) -> float:
     return float(w * h) / max(float((a[2] - a[0]) * (a[3] - a[1])), 1e-6)
 
 
-def find_objects(cands: list[Candidate], image_size: tuple[int, int], ref_size: tuple[int, int],
-                 min_area_frac=0.002, max_area_frac=0.25, max_overlap=0.5, max_span_frac=0.85,
-                 part_inside=0.9, part_score_ratio=0.4, stitch_iou=0.3) -> list[Candidate]:
-    """Return the kept objects, best score first.
+def find_objects(
+    masks: np.ndarray,
+    scores: np.ndarray,
+    min_area_frac: float = 0.002,
+    max_area_frac: float = 0.25,
+    max_overlap: float = 0.5,
+    max_span_frac: float = 0.85,
+    part_inside: float = 0.9,
+    part_score_ratio: float = 0.4,
+) -> list[tuple[np.ndarray, np.ndarray, float]]:
+    """Return [(mask, xyxy_box, score)] for each kept object.
 
     Masks are visited best score first. A mask is skipped when it is a speck or too big for one object, spans
-    almost the whole width or height (belt, floor), or lies mostly (> max_overlap) on objects already kept, which
-    removes duplicate boxes on the same object and boxes around a part of it. Sizes are relative to `ref_size`,
-    the (w, h) the models saw at once: the whole image, or one tile of a long recording.
+    almost the whole image (belt, floor), or lies mostly (> max_overlap) on objects already kept, which
+    removes duplicate boxes on the same object and boxes around a part of it.
 
     A part (cap, sleeve, label) often sits next to its object's mask rather than on it, so the mask test misses
     it. It is also dropped when its box lies at least `part_inside` inside a kept object's box and its score is
     below `part_score_ratio` x that object's score. Tested on 6 belt frames: 0.4 removed only true parts, 0.5
     already removed real items (a paper lying on a bottle).
-
-    Objects cut by a tile edge appear once per tile; their pieces are stitched back together when they overlap
-    (IoU >= stitch_iou over the shared area), see stitch().
     """
-    w, h = image_size
-    rw, rh = ref_size
-    ref_area = rw * rh
+    if len(masks) == 0:
+        return []
+    n, h, w = masks.shape
+    img_area = h * w
     claimed = np.zeros((h, w), dtype=bool)  # pixels of objects already kept
-    out: list[Candidate] = []
-    for c in sorted(cands, key=lambda c: -c.score):
-        a = int(c.mask.sum())
-        if a < min_area_frac * ref_area or a > max_area_frac * ref_area:
+    out = []
+    for i in np.argsort(-scores):
+        m = masks[i]
+        a = m.sum()
+        if a < min_area_frac * img_area or a > max_area_frac * img_area:
             continue
-        x0, y0, x1, y1 = (int(v) for v in c.box)
-        if x1 - x0 > max_span_frac * rw or y1 - y0 > max_span_frac * rh:
+        ys, xs = np.nonzero(m)
+        if xs.max() - xs.min() > max_span_frac * w or ys.max() - ys.min() > max_span_frac * h:
             continue
-        if (c.mask & claimed[y0:y1, x0:x1]).sum() / a > max_overlap:
+        if (m & claimed).sum() / a > max_overlap:
             continue
-        if any(_inside(c.box, k.box) >= part_inside and c.score < part_score_ratio * k.score for k in out):
+        box = np.array([xs.min(), ys.min(), xs.max() + 1, ys.max() + 1], np.float32)
+        if any(_inside(box, kept_box) >= part_inside and scores[i] < part_score_ratio * kept_score
+               for _, kept_box, kept_score in out):
             continue
-        out.append(c)
-        claimed[y0:y1, x0:x1] |= c.mask
-    return stitch(out, stitch_iou)
-
-
-def _union(a: Candidate, b: Candidate) -> Candidate:
-    box = np.array([min(a.box[0], b.box[0]), min(a.box[1], b.box[1]), max(a.box[2], b.box[2]), max(a.box[3], b.box[3])])
-    m = np.zeros((box[3] - box[1], box[2] - box[0]), bool)
-    for c in (a, b):
-        m[c.box[1] - box[1]:c.box[3] - box[1], c.box[0] - box[0]:c.box[2] - box[0]] |= c.mask
-    return Candidate(box, m, max(a.score, b.score), tuple(p and q for p, q in zip(a.cut, b.cut)))
-
-
-def stitch(objs: list[Candidate], min_iou: float = 0.3) -> list[Candidate]:
-    """Join pieces of one object that was cut by tile edges: a piece touching an inner tile edge is merged with a
-    kept object whose mask covers the same pixels where both boxes overlap."""
-    objs = list(objs)
-    merged = True
-    while merged:
-        merged = False
-        for i in range(len(objs)):
-            for j in range(i + 1, len(objs)):
-                a, b = objs[i], objs[j]
-                if not (any(a.cut) or any(b.cut)):
-                    continue
-                x0, y0 = max(a.box[0], b.box[0]), max(a.box[1], b.box[1])
-                x1, y1 = min(a.box[2], b.box[2]), min(a.box[3], b.box[3])
-                if x0 >= x1 or y0 >= y1:
-                    continue
-                ma = a.mask[y0 - a.box[1]:y1 - a.box[1], x0 - a.box[0]:x1 - a.box[0]]
-                mb = b.mask[y0 - b.box[1]:y1 - b.box[1], x0 - b.box[0]:x1 - b.box[0]]
-                union = (ma | mb).sum()
-                if union and (ma & mb).sum() / union >= min_iou:
-                    objs[i] = _union(a, b)
-                    del objs[j]
-                    merged = True
-                    break
-            if merged:
-                break
-    return objs
+        out.append((m, box, float(scores[i])))
+        claimed |= m
+    return out
